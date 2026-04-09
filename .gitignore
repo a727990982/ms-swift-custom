@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Build / package
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Logs
+*.log
+
+# Training outputs
+output/
+runs/
+wandb/
+swanlog/
+swanlab/
+tensorboard/
+events.out.tfevents.*
+completions.jsonl
+logging.jsonl
+
+# Checkpoints / caches
+checkpoints/
+ckpt/
+.cache/
+
+# Local temp files
+tmp/
+temp/
