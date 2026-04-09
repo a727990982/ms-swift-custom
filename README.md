@@ -48,6 +48,7 @@ export PYTHONPATH="$PWD/ms-swift-3.12.0:${PYTHONPATH}"
 python3 scripts/run_grpo_with_tb_key.py \
   --tb_group_key task \
   --external_plugins custom_plugins/grpo_tensorboard_by_key.py \
+  --logging_dir output/exp1/overall \
   --model Qwen/Qwen2.5-3B-Instruct \
   --dataset your_dataset \
   --rlhf_type grpo \
@@ -60,14 +61,16 @@ python3 scripts/run_grpo_with_tb_key.py \
 - 这个脚本不会自动注入 `ms-swift` 源码目录
 - 需要先通过 `export PYTHONPATH="$PWD/ms-swift-3.12.0:${PYTHONPATH}"` 让 Python 能找到 `swift`
 - 需要你显式通过 `--external_plugins custom_plugins/grpo_tensorboard_by_key.py` 传给 `ms-swift`
+- 如果你希望 TensorBoard 里的整体 run 名字不是 `.`, 推荐把 `--logging_dir` 设成形如 `.../overall`
 
 ## TensorBoard 查看方式
 
 写入结构示例：
 
 ```text
-logging_dir/
-├── events.out.tfevents...              # 整体指标，保持 ms-swift 原始视图
+output/exp1/
+├── overall/
+│   └── events.out.tfevents...          # 整体指标，保持 ms-swift 原始视图
 └── grouped/
     ├── task=math/
     │   └── events.out.tfevents...
@@ -87,8 +90,14 @@ eval/...
 
 这样在 TensorBoard 里可以分别看：
 
-- 整体：根 run
+- 整体：`overall`
 - 每个 key：`grouped/task=math`、`grouped/task=code` 这类单独 run
+
+推荐启动方式：
+
+```bash
+tensorboard --logdir output/exp1
+```
 
 ## 说明
 

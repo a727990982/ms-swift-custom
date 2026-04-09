@@ -92,6 +92,13 @@ def _group_run_name(group_key: str, group_value: str) -> str:
     return f'{safe_key}={safe_value}'
 
 
+def _resolve_group_run_root(logging_dir: str) -> Path:
+    logging_dir = Path(logging_dir)
+    if logging_dir.name == 'overall':
+        return logging_dir.parent / 'grouped'
+    return logging_dir / 'grouped'
+
+
 def _get_group_writer(self, group_value: str):
     writer = self._tb_group_writers.get(group_value)
     if writer is not None:
@@ -246,7 +253,7 @@ def _patch_grpo_trainer():
         try:
             from torch.utils.tensorboard import SummaryWriter
             self._tb_group_summary_writer_cls = SummaryWriter
-            self._tb_group_run_root = Path(self.args.logging_dir) / 'grouped'
+            self._tb_group_run_root = _resolve_group_run_root(self.args.logging_dir)
             logger.info(
                 f'Enabled GRPO per-category TensorBoard logging with key `{self._tb_group_key}` '
                 f'under `{self._tb_group_run_root}`. Overall metrics remain in `{self.args.logging_dir}`.')
