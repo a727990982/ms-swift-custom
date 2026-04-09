@@ -1,6 +1,7 @@
 import json
 import os
 from collections import defaultdict, deque
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -83,6 +84,24 @@ def _trim_logs(self, seen_nums: int) -> int:
     for reward_name in self.reward_func_names:
         lengths.append(len(self._logs['rewards'][reward_name]))
     return min(lengths)
+
+
+def _group_run_name(group_key: str, group_value: str) -> str:
+    safe_key = _sanitize_tag(group_key)
+    safe_value = _sanitize_tag(group_value)
+    return f'{safe_key}={safe_value}'
+
+
+def _get_group_writer(self, group_value: str):
+    writer = self._tb_group_writers.get(group_value)
+    if writer is not None:
+        return writer
+
+    run_name = _group_run_name(self._tb_group_key, group_value)
+    log_dir = self._tb_group_run_root / run_name
+    writer = self._tb_group_summary_writer_cls(log_dir=str(log_dir))
+    self._tb_group_writers[group_value] = writer
+    return writer
 
 
 def _build_rows(self, seen_nums: int) -> List[Dict[str, Any]]:
@@ -209,7 +228,9 @@ def _patch_grpo_trainer():
         original_prepare_metrics(self)
         group_key = os.environ.get(ENV_KEY, '').strip()
         self._tb_group_key = group_key or None
-        self._tb_group_writer = None
+        self._tb_group_writers = {}
+        self._tb_group_summary_writer_cls = None
+        self._tb_group_run_root = None
         self._tb_group_logs = {
             'group_value': deque(maxlen=self.args.generation_batch_size),
             'prompt_id': deque(maxlen=self.args.generation_batch_size),
@@ -224,10 +245,11 @@ def _patch_grpo_trainer():
             return
         try:
             from torch.utils.tensorboard import SummaryWriter
-            self._tb_group_writer = SummaryWriter(log_dir=self.args.logging_dir)
+            self._tb_group_summary_writer_cls = SummaryWriter
+            self._tb_group_run_root = Path(self.args.logging_dir) / 'grouped'
             logger.info(
                 f'Enabled GRPO per-category TensorBoard logging with key `{self._tb_group_key}` '
-                f'under `{self.args.logging_dir}`.')
+                f'under `{self._tb_group_run_root}`. Overall metrics remain in `{self.args.logging_dir}`.')
         except Exception as exc:
             logger.warning(f'Failed to initialize TensorBoard SummaryWriter for grouped metrics: {exc}')
 
@@ -269,7 +291,7 @@ def _patch_grpo_trainer():
 
         if not getattr(self, '_tb_group_key', None):
             return
-        if not self.accelerator.is_main_process or self._tb_group_writer is None:
+        if not self.accelerator.is_main_process or self._tb_group_summary_writer_cls is None:
             return
 
         try:
@@ -278,14 +300,13 @@ def _patch_grpo_trainer():
             rows = _build_rows(self, seen_nums)
             metrics_by_group = _compute_category_metrics(self, rows)
             mode = 'train' if self.model.training else 'eval'
-            safe_key = _sanitize_tag(self._tb_group_key)
 
             for group_value, metric_dict in metrics_by_group.items():
-                safe_value = _sanitize_tag(group_value)
-                prefix = f'{mode}/by_{safe_key}/{safe_value}'
+                writer = _get_group_writer(self, group_value)
                 for metric_name, metric_value in metric_dict.items():
-                    self._tb_group_writer.add_scalar(f'{prefix}/{metric_name}', metric_value, self.state.global_step)
-            self._tb_group_writer.flush()
+                    writer.add_scalar(f'{mode}/{metric_name}', metric_value, self.state.global_step)
+            for writer in self._tb_group_writers.values():
+                writer.flush()
         except Exception as exc:
             logger.warning(f'Failed to write grouped GRPO metrics to TensorBoard: {exc}')
 

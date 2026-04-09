@@ -5,7 +5,7 @@
 当前仓库采用“非侵入式”方式集成：
 
 - 不修改上游 `ms-swift` 原始源码
-- 通过外部 plugin 在运行时 patch `GRPOTrainer`
+- 通过 `--external_plugins` 在运行时注册外部 plugin 并 patch `GRPOTrainer`
 - 通过独立启动脚本传入分类 key
 
 ## 目录结构
@@ -31,8 +31,11 @@
 在本仓库根目录运行：
 
 ```bash
+export PYTHONPATH="$PWD/ms-swift-3.12.0:${PYTHONPATH}"
+
 python3 scripts/run_grpo_with_tb_key.py \
   --tb_group_key your_key \
+  --external_plugins custom_plugins/grpo_tensorboard_by_key.py \
   --rlhf_type grpo \
   ...其余 ms-swift GRPO 参数保持不变...
 ```
@@ -40,25 +43,52 @@ python3 scripts/run_grpo_with_tb_key.py \
 例如：
 
 ```bash
+export PYTHONPATH="$PWD/ms-swift-3.12.0:${PYTHONPATH}"
+
 python3 scripts/run_grpo_with_tb_key.py \
   --tb_group_key task \
+  --external_plugins custom_plugins/grpo_tensorboard_by_key.py \
   --model Qwen/Qwen2.5-3B-Instruct \
   --dataset your_dataset \
   --rlhf_type grpo \
   --reward_funcs format
 ```
 
-## 额外写入的 TensorBoard 路径
+说明：
 
-写入路径示例：
+- 这个脚本不会自动注入 plugin
+- 这个脚本不会自动注入 `ms-swift` 源码目录
+- 需要先通过 `export PYTHONPATH="$PWD/ms-swift-3.12.0:${PYTHONPATH}"` 让 Python 能找到 `swift`
+- 需要你显式通过 `--external_plugins custom_plugins/grpo_tensorboard_by_key.py` 传给 `ms-swift`
+
+## TensorBoard 查看方式
+
+写入结构示例：
 
 ```text
-train/by_task/math/reward
-train/by_task/code/reward_std
-train/by_task/math/rewards/format/mean
-train/by_task/code/completions/mean_length
-eval/by_task/math/...
+logging_dir/
+├── events.out.tfevents...              # 整体指标，保持 ms-swift 原始视图
+└── grouped/
+    ├── task=math/
+    │   └── events.out.tfevents...
+    └── task=code/
+        └── events.out.tfevents...
 ```
+
+每个单独 key run 里的标量名称示例：
+
+```text
+train/reward
+train/reward_std
+train/rewards/format/mean
+train/completions/mean_length
+eval/...
+```
+
+这样在 TensorBoard 里可以分别看：
+
+- 整体：根 run
+- 每个 key：`grouped/task=math`、`grouped/task=code` 这类单独 run
 
 ## 说明
 
