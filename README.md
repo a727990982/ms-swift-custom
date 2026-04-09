@@ -99,6 +99,34 @@ eval/...
 tensorboard --logdir output/exp1
 ```
 
+## 指标对齐说明
+
+当前 grouped run 与 overall run 已经按同一个 `log()` 窗口统计，因此下面这些指标可以直接和 overall 对比：
+
+- `completions/mean_length`
+- `completions/min_length`
+- `completions/max_length`
+- `entropy/mean`
+- `entropy/min`
+- `entropy/max`
+- `rewards/<name>/mean`
+- `rewards/<name>/std`
+- `num_turns`
+
+下面这些指标在部分配置下仍然可能和 overall 存在口径差异：
+
+- `reward`、`reward_std`、`frac_reward_zero_std`
+  - 当 `kl_in_reward=True` 时，overall 会额外扣除 KL，grouped 当前不会
+  - 当 `scale_rewards=batch` 时，overall 的 `reward_std` 使用全局 std，grouped 当前按组内 std 聚合
+- `completions/clipped_ratio`
+  - 当 `dynamic_num_samples=True` 时，overall 会按 `request_id` 去重后再统计，grouped 当前按分组内全部 completion 统计
+
+另外：
+
+- `samples` 是 grouped 额外提供的辅助指标，overall 中没有对应项
+- `kl`、`entropy/threshold`、`rollout_correction/*`、clipping 系列指标目前不会按 key 拆分
+- 已经生成的旧 TensorBoard event 文件不会自动修正，新的口径需要从新的训练日志中观察
+
 ## 说明
 
 - 这套实现更适合“与样本强相关”的 GRPO 指标，例如 reward、reward_std、completion length、entropy 等

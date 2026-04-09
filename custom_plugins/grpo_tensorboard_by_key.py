@@ -1,6 +1,6 @@
 import json
 import os
-from collections import defaultdict, deque
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -77,13 +77,48 @@ def _safe_float(value: Any) -> Optional[float]:
     return value
 
 
-def _trim_logs(self, seen_nums: int) -> int:
-    lengths = [seen_nums]
-    for key in ['group_value', 'prompt_id', 'request_id', 'completion_length', 'truncated', 'num_turns']:
-        lengths.append(len(self._tb_group_logs[key]))
+def _new_group_window() -> Dict[str, Any]:
+    return {
+        'group_value': [],
+        'prompt_id': [],
+        'request_id': [],
+        'completion_length': [],
+        'truncated': [],
+        'num_turns': [],
+        'entropy': [],
+        'rewards': defaultdict(list),
+    }
+
+
+def _clear_group_window(window: Dict[str, Any]) -> None:
+    window['group_value'].clear()
+    window['prompt_id'].clear()
+    window['request_id'].clear()
+    window['completion_length'].clear()
+    window['truncated'].clear()
+    window['num_turns'].clear()
+    window['entropy'].clear()
+    window['rewards'] = defaultdict(list)
+
+
+def _get_group_window(self, mode: Optional[str] = None) -> Dict[str, Any]:
+    if mode is None:
+        mode = 'train' if self.model.training else 'eval'
+    return self._tb_group_windows[mode]
+
+
+def _window_sample_count(self, window: Dict[str, Any]) -> int:
+    lengths = [
+        len(window['group_value']),
+        len(window['prompt_id']),
+        len(window['request_id']),
+        len(window['completion_length']),
+        len(window['truncated']),
+        len(window['num_turns']),
+    ]
     for reward_name in self.reward_func_names:
-        lengths.append(len(self._logs['rewards'][reward_name]))
-    return min(lengths)
+        lengths.append(len(window['rewards'][reward_name]))
+    return min(lengths) if lengths else 0
 
 
 def _group_run_name(group_key: str, group_value: str) -> str:
@@ -111,17 +146,21 @@ def _get_group_writer(self, group_value: str):
     return writer
 
 
-def _build_rows(self, seen_nums: int) -> List[Dict[str, Any]]:
+def _build_rows(self, window: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows = []
-    group_values = list(self._tb_group_logs['group_value'])[:seen_nums]
-    prompt_ids = list(self._tb_group_logs['prompt_id'])[:seen_nums]
-    request_ids = list(self._tb_group_logs['request_id'])[:seen_nums]
-    completion_lengths = list(self._tb_group_logs['completion_length'])[:seen_nums]
-    truncated = list(self._tb_group_logs['truncated'])[:seen_nums]
-    num_turns = list(self._tb_group_logs['num_turns'])[:seen_nums]
-    entropy_logs = list(self._logs.get('entropy', []))[:seen_nums]
+    seen_nums = _window_sample_count(self, window)
+    if seen_nums == 0:
+        return rows
+
+    group_values = window['group_value'][:seen_nums]
+    prompt_ids = window['prompt_id'][:seen_nums]
+    request_ids = window['request_id'][:seen_nums]
+    completion_lengths = window['completion_length'][:seen_nums]
+    truncated = window['truncated'][:seen_nums]
+    num_turns = window['num_turns'][:seen_nums]
+    entropy_logs = window['entropy'][:seen_nums] if len(window['entropy']) == seen_nums else []
     reward_values = {
-        name: list(self._logs['rewards'][name])[:seen_nums]
+        name: window['rewards'][name][:seen_nums]
         for name in self.reward_func_names
     }
 
@@ -201,9 +240,9 @@ def _compute_category_metrics(self, rows: List[Dict[str, Any]]) -> Dict[str, Dic
             metrics['completions/min_length'] = float(min(completion_lengths))
             metrics['completions/max_length'] = float(max(completion_lengths))
 
-        if group_unique_rows:
+        if group_rows:
             metrics['completions/clipped_ratio'] = float(
-                sum(bool(row['truncated']) for row in group_unique_rows) / len(group_unique_rows))
+                sum(bool(row['truncated']) for row in group_rows) / len(group_rows))
 
         entropy_values = [row['entropy'] for row in group_rows if row['entropy'] is not None]
         if entropy_values:
@@ -229,6 +268,8 @@ def _patch_grpo_trainer():
 
     original_prepare_metrics = GRPOTrainer._prepare_metrics
     original_generate_and_score_completions = GRPOTrainer._generate_and_score_completions
+    original_compute_advantages = GRPOTrainer._compute_advantages
+    original_update_metrics = GRPOTrainer._update_metrics
     original_log = GRPOTrainer.log
 
     def _prepare_metrics(self):
@@ -238,13 +279,9 @@ def _patch_grpo_trainer():
         self._tb_group_writers = {}
         self._tb_group_summary_writer_cls = None
         self._tb_group_run_root = None
-        self._tb_group_logs = {
-            'group_value': deque(maxlen=self.args.generation_batch_size),
-            'prompt_id': deque(maxlen=self.args.generation_batch_size),
-            'request_id': deque(maxlen=self.args.generation_batch_size),
-            'completion_length': deque(maxlen=self.args.generation_batch_size),
-            'truncated': deque(maxlen=self.args.generation_batch_size),
-            'num_turns': deque(maxlen=self.args.generation_batch_size),
+        self._tb_group_windows = {
+            'train': _new_group_window(),
+            'eval': _new_group_window(),
         }
         if not self._tb_group_key:
             return
@@ -266,6 +303,7 @@ def _patch_grpo_trainer():
             return result
 
         try:
+            window = _get_group_window(self)
             group_values = gather_object([_extract_group_value(inp, self._tb_group_key) for inp in inputs])
             prompt_ids = gather_object([inp.get('prompt_id') for inp in inputs])
             request_ids = gather_object([inp.get('request_id') for inp in inputs])
@@ -282,16 +320,45 @@ def _patch_grpo_trainer():
             else:
                 total_num_turns = [None] * len(group_values)
 
-            self._tb_group_logs['group_value'].extend(group_values)
-            self._tb_group_logs['prompt_id'].extend(prompt_ids)
-            self._tb_group_logs['request_id'].extend(request_ids)
-            self._tb_group_logs['completion_length'].extend(total_lengths)
-            self._tb_group_logs['truncated'].extend(total_truncated)
-            self._tb_group_logs['num_turns'].extend(total_num_turns)
+            window['group_value'].extend(group_values)
+            window['prompt_id'].extend(prompt_ids)
+            window['request_id'].extend(request_ids)
+            window['completion_length'].extend(total_lengths)
+            window['truncated'].extend(total_truncated)
+            window['num_turns'].extend(total_num_turns)
         except Exception as exc:
             logger.warning(f'Failed to collect grouped GRPO metrics: {exc}')
 
         return result
+
+    def _compute_advantages(self, inputs, rewards_per_func, batch_encoded_inputs):
+        advantages = original_compute_advantages(self, inputs, rewards_per_func, batch_encoded_inputs)
+
+        if not getattr(self, '_tb_group_key', None):
+            return advantages
+
+        try:
+            window = _get_group_window(self)
+            reward_rows = rewards_per_func.detach().float().cpu().tolist()
+            for reward_idx, reward_name in enumerate(self.reward_func_names):
+                window['rewards'][reward_name].extend(row[reward_idx] for row in reward_rows)
+        except Exception as exc:
+            logger.warning(f'Failed to collect grouped GRPO reward metrics: {exc}')
+
+        return advantages
+
+    def _update_metrics(self, metrics_data):
+        if getattr(self, '_tb_group_key', None):
+            try:
+                entropy_metrics = metrics_data.get('entropy') or {}
+                entropy_logs = entropy_metrics.get('entropy_logs')
+                if entropy_logs is not None:
+                    window = _get_group_window(self, metrics_data.get('mode'))
+                    window['entropy'].extend(entropy_logs)
+            except Exception as exc:
+                logger.warning(f'Failed to collect grouped GRPO entropy metrics: {exc}')
+
+        return original_update_metrics(self, metrics_data)
 
     def log(self, logs, start_time=None):
         original_log(self, logs, start_time)
@@ -301,12 +368,11 @@ def _patch_grpo_trainer():
         if not self.accelerator.is_main_process or self._tb_group_summary_writer_cls is None:
             return
 
+        mode = 'train' if self.model.training else 'eval'
         try:
-            seen_nums = len(self._logs['entropy']) if 'entropy' in self._logs else len(self._logs['prompt'])
-            seen_nums = _trim_logs(self, seen_nums)
-            rows = _build_rows(self, seen_nums)
+            window = _get_group_window(self, mode)
+            rows = _build_rows(self, window)
             metrics_by_group = _compute_category_metrics(self, rows)
-            mode = 'train' if self.model.training else 'eval'
 
             for group_value, metric_dict in metrics_by_group.items():
                 writer = _get_group_writer(self, group_value)
@@ -316,9 +382,13 @@ def _patch_grpo_trainer():
                 writer.flush()
         except Exception as exc:
             logger.warning(f'Failed to write grouped GRPO metrics to TensorBoard: {exc}')
+        finally:
+            _clear_group_window(_get_group_window(self, mode))
 
     GRPOTrainer._prepare_metrics = _prepare_metrics
     GRPOTrainer._generate_and_score_completions = _generate_and_score_completions
+    GRPOTrainer._compute_advantages = _compute_advantages
+    GRPOTrainer._update_metrics = _update_metrics
     GRPOTrainer.log = log
     setattr(GRPOTrainer, PLUGIN_TAG, True)
 
