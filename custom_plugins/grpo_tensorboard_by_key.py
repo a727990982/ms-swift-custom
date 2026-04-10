@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
-from accelerate.utils import gather, gather_object
+from accelerate.utils import gather_object
 
 from swift.utils import get_logger
 
@@ -147,12 +147,26 @@ def _get_group_writer(self, group_value: str):
     return writer
 
 
+def _gather_list(values: List[Any]) -> List[Any]:
+    gathered = gather_object(values)
+    if isinstance(gathered, tuple):
+        return list(gathered)
+    if isinstance(gathered, list):
+        if gathered and all(isinstance(item, (list, tuple)) for item in gathered):
+            flat = []
+            for item in gathered:
+                flat.extend(list(item))
+            return flat
+        return gathered
+    return [gathered]
+
+
 def _collect_group_fields(self, inputs) -> Dict[str, List[Any]]:
-    group_values = gather_object([_extract_group_value(inp, self._tb_group_key) for inp in inputs])
-    prompt_ids = gather_object([inp.get('prompt_id') for inp in inputs])
-    request_ids = gather_object([inp.get('request_id') for inp in inputs])
+    group_values = [_extract_group_value(inp, self._tb_group_key) for inp in inputs]
+    prompt_ids = [inp.get('prompt_id') for inp in inputs]
+    request_ids = [inp.get('request_id') for inp in inputs]
     if all('rollout_infos' in inp and 'num_turns' in inp['rollout_infos'] for inp in inputs):
-        num_turns = gather_object([inp['rollout_infos']['num_turns'] for inp in inputs])
+        num_turns = [inp['rollout_infos']['num_turns'] for inp in inputs]
     else:
         num_turns = [None] * len(group_values)
     return {
@@ -163,63 +177,77 @@ def _collect_group_fields(self, inputs) -> Dict[str, List[Any]]:
     }
 
 
+def _collect_global_group_fields(self, inputs) -> Dict[str, List[Any]]:
+    global_inputs = _gather_list(inputs)
+    return {
+        'group_values': [_extract_group_value(inp, self._tb_group_key) for inp in global_inputs],
+        'prompt_ids': [inp.get('prompt_id') for inp in global_inputs],
+        'request_ids': [inp.get('request_id') for inp in global_inputs],
+    }
+
+
 def _record_generation_metrics(self, window: Dict[str, Any], result, fields: Dict[str, List[Any]]) -> None:
-    group_values = fields['group_values']
-    request_ids = fields['request_ids']
-    total_num_turns = fields['num_turns']
+    local_rows = []
+    cursor = 0
+    for batch in result:
+        batch_size = int(batch['completion_mask'].shape[0])
+        batch_group_values = fields['group_values'][cursor:cursor + batch_size]
+        batch_request_ids = fields['request_ids'][cursor:cursor + batch_size]
+        batch_num_turns = fields['num_turns'][cursor:cursor + batch_size]
+        if len(batch_group_values) != batch_size or len(batch_request_ids) != batch_size or len(batch_num_turns) != batch_size:
+            logger.warning('Skipped grouped generation metrics because local group metadata did not match batch size.')
+            return
+        batch_lengths = batch['completion_mask'].sum(1).tolist()
+        batch_truncated = batch['truncated_mask'].tolist()
+        batch['tb_group_values'] = batch_group_values
+        for idx in range(batch_size):
+            local_rows.append({
+                'group_value': batch_group_values[idx],
+                'request_id': batch_request_ids[idx],
+                'length': float(batch_lengths[idx]),
+                'truncated': bool(batch_truncated[idx]),
+                'num_turns': batch_num_turns[idx],
+            })
+        cursor += batch_size
 
-    local_lengths = [batch['completion_mask'].sum(1).tolist() for batch in result]
-    total_lengths = self._gather_and_flatten(
-        local_lengths, dtype=torch.float32, device=self.accelerator.device, flatten_level=1).tolist()
-    local_truncated = [batch['truncated_mask'].tolist() for batch in result]
-    total_truncated = self._gather_and_flatten(
-        local_truncated, dtype=torch.bool, device=self.accelerator.device, flatten_level=1).tolist()
+    if cursor != len(fields['group_values']):
+        logger.warning('Skipped grouped generation metrics because batch sizes did not match local group values.')
+        return
 
-    group_to_indices = defaultdict(list)
-    for idx, group_value in enumerate(group_values):
-        group_to_indices[group_value].append(idx)
+    rows = _gather_list(local_rows)
+    group_to_rows = defaultdict(list)
+    for row in rows:
+        group_to_rows[row['group_value']].append(row)
 
-    last_indices = _last_indices(request_ids) if self.dynamic_num_samples else None
-    for group_value, indices in group_to_indices.items():
-        group_lengths = [float(total_lengths[idx]) for idx in indices]
-        _append_group_metric(window, group_value, 'samples', float(len(indices)))
+    last_indices = _last_indices([row['request_id'] for row in rows]) if self.dynamic_num_samples else None
+    for group_value, group_rows in group_to_rows.items():
+        group_lengths = [row['length'] for row in group_rows]
+        _append_group_metric(window, group_value, 'samples', float(len(group_rows)))
         _append_group_metric(window, group_value, 'completions/mean_length',
                              float(sum(group_lengths) / len(group_lengths)))
         _append_group_metric(window, group_value, 'completions/min_length', float(min(group_lengths)))
         _append_group_metric(window, group_value, 'completions/max_length', float(max(group_lengths)))
 
         if not self.dynamic_num_samples:
-            group_truncated = [bool(total_truncated[idx]) for idx in indices]
             _append_group_metric(window, group_value, 'completions/clipped_ratio',
-                                 float(sum(group_truncated) / len(group_truncated)))
-            if all(value is not None for value in total_num_turns):
-                group_num_turns = [float(total_num_turns[idx]) for idx in indices]
+                                 float(sum(row['truncated'] for row in group_rows) / len(group_rows)))
+            group_num_turns = [float(row['num_turns']) for row in group_rows if row['num_turns'] is not None]
+            if len(group_num_turns) == len(group_rows):
                 _append_group_metric(window, group_value, 'num_turns',
                                      float(sum(group_num_turns) / len(group_num_turns)))
         else:
-            final_indices = [idx for idx in last_indices if group_values[idx] == group_value]
-            if final_indices:
-                final_truncated = [bool(total_truncated[idx]) for idx in final_indices]
+            final_rows = [rows[idx] for idx in last_indices if rows[idx]['group_value'] == group_value]
+            if final_rows:
                 _append_group_metric(window, group_value, 'completions/clipped_ratio',
-                                     float(sum(final_truncated) / len(final_truncated)))
-                if all(value is not None for value in total_num_turns):
-                    final_num_turns = [float(total_num_turns[idx]) for idx in final_indices]
+                                     float(sum(row['truncated'] for row in final_rows) / len(final_rows)))
+                final_num_turns = [float(row['num_turns']) for row in final_rows if row['num_turns'] is not None]
+                if len(final_num_turns) == len(final_rows):
                     _append_group_metric(window, group_value, 'num_turns',
                                          float(sum(final_num_turns) / len(final_num_turns)))
 
-    cursor = 0
-    for batch in result:
-        batch_size = int(batch['completion_mask'].shape[0])
-        batch['tb_group_values'] = group_values[cursor:cursor + batch_size]
-        cursor += batch_size
-
 
 def _record_reward_metrics(self, window: Dict[str, Any], inputs, rewards_per_func, batch_encoded_inputs) -> None:
-    fields = _collect_group_fields(self, inputs)
-    group_values = fields['group_values']
-    prompt_ids = fields['prompt_ids']
-    request_ids = fields['request_ids']
-
+    fields = _collect_global_group_fields(self, inputs)
     reward_rows = rewards_per_func.detach().float().cpu().tolist()
     weights = self.reward_weights.detach().float().cpu().tolist()
     total_rewards = []
@@ -232,30 +260,44 @@ def _record_reward_metrics(self, window: Dict[str, Any], inputs, rewards_per_fun
         total_rewards.append(reward_total)
 
     if self.kl_in_reward and self.beta != 0.0:
-        kl_list = []
+        local_kl_values = []
         for batch_encoded in batch_encoded_inputs:
             old_per_token_logps = batch_encoded['old_per_token_logps']
             ref_per_token_logps = batch_encoded['ref_per_token_logps']
             completion_mask = batch_encoded['completion_mask']
-            kl_list.append(((old_per_token_logps - ref_per_token_logps) * completion_mask).sum(-1))
-        kl_values = gather(torch.cat(kl_list, dim=0)).detach().float().cpu().tolist()
+            local_kl_values.extend((((old_per_token_logps - ref_per_token_logps) * completion_mask).sum(-1)
+                                    ).detach().float().cpu().tolist())
+        kl_values = _gather_list(local_kl_values)
+        if len(kl_values) != len(total_rewards):
+            logger.warning('Skipped grouped reward metrics because global KL values and rewards had different lengths.')
+            return
         total_rewards = [
             float(reward_value - self.beta * kl_value)
             for reward_value, kl_value in zip(total_rewards, kl_values)
         ]
 
+    total_count = min(len(fields['group_values']), len(total_rewards), len(reward_rows))
+    if total_count == 0:
+        return
+    if len(fields['group_values']) != len(total_rewards) or len(total_rewards) != len(reward_rows):
+        logger.warning('Skipped grouped reward metrics because global group fields and rewards had different lengths.')
+        return
+
+    rows = [{
+        'group_value': fields['group_values'][idx],
+        'prompt_id': fields['prompt_ids'][idx],
+        'request_id': fields['request_ids'][idx],
+        'total_reward': float(total_rewards[idx]),
+        'reward_values': reward_rows[idx],
+    } for idx in range(total_count)]
     if self.dynamic_num_samples:
-        unique_indices = _last_indices(request_ids)
-        group_values = [group_values[idx] for idx in unique_indices]
-        prompt_ids = [prompt_ids[idx] for idx in unique_indices]
-        total_rewards = [float(total_rewards[idx]) for idx in unique_indices]
-        reward_rows = [reward_rows[idx] for idx in unique_indices]
+        rows = [rows[idx] for idx in _last_indices([row['request_id'] for row in rows])]
 
     group_to_prompt_rewards = defaultdict(lambda: defaultdict(list))
-    group_to_reward_indices = defaultdict(list)
-    for idx, group_value in enumerate(group_values):
-        group_to_prompt_rewards[group_value][prompt_ids[idx]].append(float(total_rewards[idx]))
-        group_to_reward_indices[group_value].append(idx)
+    group_to_rows = defaultdict(list)
+    for row in rows:
+        group_to_prompt_rewards[row['group_value']][row['prompt_id']].append(row['total_reward'])
+        group_to_rows[row['group_value']].append(row)
 
     for group_value, prompt_rewards in group_to_prompt_rewards.items():
         prompt_means = [_mean(values) for values in prompt_rewards.values()]
@@ -267,7 +309,7 @@ def _record_reward_metrics(self, window: Dict[str, Any], inputs, rewards_per_fun
         if self.scale_rewards in ['group', 'none']:
             reward_std = _mean_or_none(prompt_stds)
         else:
-            reward_std = _std_or_zero([total_rewards[idx] for idx in group_to_reward_indices[group_value]])
+            reward_std = _std_or_zero([row['total_reward'] for row in group_to_rows[group_value]])
         if reward_std is not None:
             _append_group_metric(window, group_value, 'reward_std', reward_std)
         if prompt_stds:
@@ -275,8 +317,7 @@ def _record_reward_metrics(self, window: Dict[str, Any], inputs, rewards_per_fun
                                  float(sum(std == 0.0 for std in prompt_stds) / len(prompt_stds)))
 
         for reward_idx, reward_name in enumerate(self.reward_func_names):
-            reward_name_values = [_safe_float(reward_rows[idx][reward_idx])
-                                  for idx in group_to_reward_indices[group_value]]
+            reward_name_values = [_safe_float(row['reward_values'][reward_idx]) for row in group_to_rows[group_value]]
             reward_name_mean = _mean_or_none(reward_name_values)
             if reward_name_mean is not None:
                 _append_group_metric(window, group_value, f'rewards/{reward_name}/mean', reward_name_mean)
@@ -291,8 +332,7 @@ def _record_entropy_metrics(self, window: Dict[str, Any], inputs, metrics_data) 
     if entropy_logs is None or group_values is None:
         return
 
-    global_group_values = gather_object(group_values)
-    flattened_group_values = [value for values in global_group_values for value in values]
+    flattened_group_values = _gather_list(group_values)
     if len(flattened_group_values) != len(entropy_logs):
         logger.warning('Skipped grouped entropy metrics because group values and entropy logs had different lengths.')
         return
@@ -319,6 +359,7 @@ def _patch_grpo_trainer():
     original_generate_and_score_completions = GRPOTrainer._generate_and_score_completions
     original_compute_advantages = GRPOTrainer._compute_advantages
     original_compute_loss_and_metrics = GRPOTrainer._compute_loss_and_metrics
+    original_get_chunked_inputs = GRPOTrainer.get_chunked_inputs
     original_log = GRPOTrainer.log
 
     def _prepare_metrics(self):
@@ -371,6 +412,12 @@ def _patch_grpo_trainer():
             logger.warning(f'Failed to collect grouped GRPO entropy metrics: {exc}')
         return loss, metrics_data
 
+    def get_chunked_inputs(self, inputs, start_idx, end_idx):
+        chunk_inputs = original_get_chunked_inputs(self, inputs, start_idx, end_idx)
+        if 'tb_group_values' in chunk_inputs and isinstance(chunk_inputs['tb_group_values'], (list, tuple)):
+            chunk_inputs['tb_group_values'] = list(chunk_inputs['tb_group_values'][start_idx:end_idx])
+        return chunk_inputs
+
     def log(self, logs, start_time=None):
         original_log(self, logs, start_time)
         if not getattr(self, '_tb_group_key', None):
@@ -396,6 +443,7 @@ def _patch_grpo_trainer():
     GRPOTrainer._generate_and_score_completions = _generate_and_score_completions
     GRPOTrainer._compute_advantages = _compute_advantages
     GRPOTrainer._compute_loss_and_metrics = _compute_loss_and_metrics
+    GRPOTrainer.get_chunked_inputs = get_chunked_inputs
     GRPOTrainer.log = log
     setattr(GRPOTrainer, PLUGIN_TAG, True)
 

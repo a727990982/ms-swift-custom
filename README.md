@@ -82,13 +82,15 @@ plugin 目前会按 key 写出这些 grouped 指标：
 - 使用同一个 `log()` 窗口
 - `completion` 和 `reward` 类指标按 rollout 级标量记录后再聚合
 - `entropy` 类指标按 loss 计算时的 batch 级标量记录后再聚合
+- 多卡场景下优先按“完整样本记录”做 gather，避免 group 字段和数值张量错位
+- `chunked loss` 场景下会同步切分 `tb_group_values`，避免 grouped entropy 在分 chunk 时错位
 
 因此日常最常看的 grouped 曲线可以直接和 overall 对比。
 
 仍需注意：
 
 - 如果你已经生成过旧的 TensorBoard event 文件，旧曲线不会被自动修正
-- 在极少数 `dynamic_num_samples` 触发 chunked loss 的场景下，`entropy` 极值的展示仍可能和 overall 存在轻微差异
+- 如果运行时出现 `Skipped grouped ...` 警告，表示当前批次的分组元数据和上游日志长度不一致；这类批次会被跳过，不会静默写入错误指标
 
 ## 仓库结构
 
