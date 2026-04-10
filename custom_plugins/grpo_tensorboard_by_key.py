@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
-from accelerate.utils import gather_object
+from accelerate.utils import gather, gather_object
 
 from swift.utils import get_logger
 
@@ -72,33 +72,31 @@ def _safe_float(value: Any) -> Optional[float]:
         value = float(value)
     except (TypeError, ValueError):
         return None
-    if value != value:  # nan
+    if value != value:
         return None
     return value
 
 
+def _mean_or_none(values: List[Optional[float]]) -> Optional[float]:
+    clean_values = [float(v) for v in values if v is not None]
+    if not clean_values:
+        return None
+    return float(sum(clean_values) / len(clean_values))
+
+
+def _std_or_zero(values: List[Optional[float]]) -> float:
+    clean_values = [float(v) for v in values if v is not None]
+    if len(clean_values) <= 1:
+        return 0.0
+    return _std(clean_values)
+
+
 def _new_group_window() -> Dict[str, Any]:
-    return {
-        'group_value': [],
-        'prompt_id': [],
-        'request_id': [],
-        'completion_length': [],
-        'truncated': [],
-        'num_turns': [],
-        'entropy': [],
-        'rewards': defaultdict(list),
-    }
+    return {'metric_values': defaultdict(lambda: defaultdict(list))}
 
 
 def _clear_group_window(window: Dict[str, Any]) -> None:
-    window['group_value'].clear()
-    window['prompt_id'].clear()
-    window['request_id'].clear()
-    window['completion_length'].clear()
-    window['truncated'].clear()
-    window['num_turns'].clear()
-    window['entropy'].clear()
-    window['rewards'] = defaultdict(list)
+    window['metric_values'] = defaultdict(lambda: defaultdict(list))
 
 
 def _get_group_window(self, mode: Optional[str] = None) -> Dict[str, Any]:
@@ -107,24 +105,28 @@ def _get_group_window(self, mode: Optional[str] = None) -> Dict[str, Any]:
     return self._tb_group_windows[mode]
 
 
-def _window_sample_count(self, window: Dict[str, Any]) -> int:
-    lengths = [
-        len(window['group_value']),
-        len(window['prompt_id']),
-        len(window['request_id']),
-        len(window['completion_length']),
-        len(window['truncated']),
-        len(window['num_turns']),
-    ]
-    for reward_name in self.reward_func_names:
-        lengths.append(len(window['rewards'][reward_name]))
-    return min(lengths) if lengths else 0
+def _append_group_metric(window: Dict[str, Any], group_value: str, metric_name: str, metric_value: float) -> None:
+    window['metric_values'][group_value][metric_name].append(float(metric_value))
+
+
+def _build_window_metrics(window: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    metrics_by_group: Dict[str, Dict[str, float]] = {}
+    for group_value, metric_values in window['metric_values'].items():
+        metrics: Dict[str, float] = {}
+        for metric_name, values in metric_values.items():
+            if not values:
+                continue
+            if metric_name == 'samples':
+                metrics[metric_name] = float(sum(values))
+            else:
+                metrics[metric_name] = float(sum(values) / len(values))
+        if metrics:
+            metrics_by_group[group_value] = metrics
+    return metrics_by_group
 
 
 def _group_run_name(group_key: str, group_value: str) -> str:
-    safe_key = _sanitize_tag(group_key)
-    safe_value = _sanitize_tag(group_value)
-    return f'{safe_key}={safe_value}'
+    return f'{_sanitize_tag(group_key)}={_sanitize_tag(group_value)}'
 
 
 def _resolve_group_run_root(logging_dir: str) -> Path:
@@ -139,125 +141,172 @@ def _get_group_writer(self, group_value: str):
     if writer is not None:
         return writer
 
-    run_name = _group_run_name(self._tb_group_key, group_value)
-    log_dir = self._tb_group_run_root / run_name
+    log_dir = self._tb_group_run_root / _group_run_name(self._tb_group_key, group_value)
     writer = self._tb_group_summary_writer_cls(log_dir=str(log_dir))
     self._tb_group_writers[group_value] = writer
     return writer
 
 
-def _build_rows(self, window: Dict[str, Any]) -> List[Dict[str, Any]]:
-    rows = []
-    seen_nums = _window_sample_count(self, window)
-    if seen_nums == 0:
-        return rows
-
-    group_values = window['group_value'][:seen_nums]
-    prompt_ids = window['prompt_id'][:seen_nums]
-    request_ids = window['request_id'][:seen_nums]
-    completion_lengths = window['completion_length'][:seen_nums]
-    truncated = window['truncated'][:seen_nums]
-    num_turns = window['num_turns'][:seen_nums]
-    entropy_logs = window['entropy'][:seen_nums] if len(window['entropy']) == seen_nums else []
-    reward_values = {
-        name: window['rewards'][name][:seen_nums]
-        for name in self.reward_func_names
+def _collect_group_fields(self, inputs) -> Dict[str, List[Any]]:
+    group_values = gather_object([_extract_group_value(inp, self._tb_group_key) for inp in inputs])
+    prompt_ids = gather_object([inp.get('prompt_id') for inp in inputs])
+    request_ids = gather_object([inp.get('request_id') for inp in inputs])
+    if all('rollout_infos' in inp and 'num_turns' in inp['rollout_infos'] for inp in inputs):
+        num_turns = gather_object([inp['rollout_infos']['num_turns'] for inp in inputs])
+    else:
+        num_turns = [None] * len(group_values)
+    return {
+        'group_values': group_values,
+        'prompt_ids': prompt_ids,
+        'request_ids': request_ids,
+        'num_turns': num_turns,
     }
 
+
+def _record_generation_metrics(self, window: Dict[str, Any], result, fields: Dict[str, List[Any]]) -> None:
+    group_values = fields['group_values']
+    request_ids = fields['request_ids']
+    total_num_turns = fields['num_turns']
+
+    local_lengths = [batch['completion_mask'].sum(1).tolist() for batch in result]
+    total_lengths = self._gather_and_flatten(
+        local_lengths, dtype=torch.float32, device=self.accelerator.device, flatten_level=1).tolist()
+    local_truncated = [batch['truncated_mask'].tolist() for batch in result]
+    total_truncated = self._gather_and_flatten(
+        local_truncated, dtype=torch.bool, device=self.accelerator.device, flatten_level=1).tolist()
+
+    group_to_indices = defaultdict(list)
+    for idx, group_value in enumerate(group_values):
+        group_to_indices[group_value].append(idx)
+
+    last_indices = _last_indices(request_ids) if self.dynamic_num_samples else None
+    for group_value, indices in group_to_indices.items():
+        group_lengths = [float(total_lengths[idx]) for idx in indices]
+        _append_group_metric(window, group_value, 'samples', float(len(indices)))
+        _append_group_metric(window, group_value, 'completions/mean_length',
+                             float(sum(group_lengths) / len(group_lengths)))
+        _append_group_metric(window, group_value, 'completions/min_length', float(min(group_lengths)))
+        _append_group_metric(window, group_value, 'completions/max_length', float(max(group_lengths)))
+
+        if not self.dynamic_num_samples:
+            group_truncated = [bool(total_truncated[idx]) for idx in indices]
+            _append_group_metric(window, group_value, 'completions/clipped_ratio',
+                                 float(sum(group_truncated) / len(group_truncated)))
+            if all(value is not None for value in total_num_turns):
+                group_num_turns = [float(total_num_turns[idx]) for idx in indices]
+                _append_group_metric(window, group_value, 'num_turns',
+                                     float(sum(group_num_turns) / len(group_num_turns)))
+        else:
+            final_indices = [idx for idx in last_indices if group_values[idx] == group_value]
+            if final_indices:
+                final_truncated = [bool(total_truncated[idx]) for idx in final_indices]
+                _append_group_metric(window, group_value, 'completions/clipped_ratio',
+                                     float(sum(final_truncated) / len(final_truncated)))
+                if all(value is not None for value in total_num_turns):
+                    final_num_turns = [float(total_num_turns[idx]) for idx in final_indices]
+                    _append_group_metric(window, group_value, 'num_turns',
+                                         float(sum(final_num_turns) / len(final_num_turns)))
+
+    cursor = 0
+    for batch in result:
+        batch_size = int(batch['completion_mask'].shape[0])
+        batch['tb_group_values'] = group_values[cursor:cursor + batch_size]
+        cursor += batch_size
+
+
+def _record_reward_metrics(self, window: Dict[str, Any], inputs, rewards_per_func, batch_encoded_inputs) -> None:
+    fields = _collect_group_fields(self, inputs)
+    group_values = fields['group_values']
+    prompt_ids = fields['prompt_ids']
+    request_ids = fields['request_ids']
+
+    reward_rows = rewards_per_func.detach().float().cpu().tolist()
     weights = self.reward_weights.detach().float().cpu().tolist()
-    for idx in range(seen_nums):
-        reward_items = {}
-        total_reward = 0.0
-        valid_reward = False
-        for reward_name, weight in zip(self.reward_func_names, weights):
-            reward_value = _safe_float(reward_values[reward_name][idx])
-            reward_items[reward_name] = reward_value
-            if reward_value is not None:
-                total_reward += reward_value * float(weight)
-                valid_reward = True
+    total_rewards = []
+    for row in reward_rows:
+        reward_total = 0.0
+        for reward_value, weight in zip(row, weights):
+            safe_value = _safe_float(reward_value)
+            if safe_value is not None:
+                reward_total += safe_value * float(weight)
+        total_rewards.append(reward_total)
 
-        entropy = entropy_logs[idx] if idx < len(entropy_logs) else None
-        rows.append({
-            'group_value': group_values[idx],
-            'prompt_id': prompt_ids[idx],
-            'request_id': request_ids[idx],
-            'completion_length': _safe_float(completion_lengths[idx]),
-            'truncated': bool(truncated[idx]),
-            'num_turns': _safe_float(num_turns[idx]),
-            'entropy': _safe_float(entropy),
-            'rewards': reward_items,
-            'total_reward': total_reward if valid_reward else None,
-        })
-    return rows
+    if self.kl_in_reward and self.beta != 0.0:
+        kl_list = []
+        for batch_encoded in batch_encoded_inputs:
+            old_per_token_logps = batch_encoded['old_per_token_logps']
+            ref_per_token_logps = batch_encoded['ref_per_token_logps']
+            completion_mask = batch_encoded['completion_mask']
+            kl_list.append(((old_per_token_logps - ref_per_token_logps) * completion_mask).sum(-1))
+        kl_values = gather(torch.cat(kl_list, dim=0)).detach().float().cpu().tolist()
+        total_rewards = [
+            float(reward_value - self.beta * kl_value)
+            for reward_value, kl_value in zip(total_rewards, kl_values)
+        ]
 
+    if self.dynamic_num_samples:
+        unique_indices = _last_indices(request_ids)
+        group_values = [group_values[idx] for idx in unique_indices]
+        prompt_ids = [prompt_ids[idx] for idx in unique_indices]
+        total_rewards = [float(total_rewards[idx]) for idx in unique_indices]
+        reward_rows = [reward_rows[idx] for idx in unique_indices]
 
-def _compute_category_metrics(self, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
-    metrics_by_group: Dict[str, Dict[str, float]] = {}
-    if not rows:
-        return metrics_by_group
+    group_to_prompt_rewards = defaultdict(lambda: defaultdict(list))
+    group_to_reward_indices = defaultdict(list)
+    for idx, group_value in enumerate(group_values):
+        group_to_prompt_rewards[group_value][prompt_ids[idx]].append(float(total_rewards[idx]))
+        group_to_reward_indices[group_value].append(idx)
 
-    unique_indices = _last_indices([row['request_id'] for row in rows])
-    unique_rows = [rows[idx] for idx in unique_indices]
-
-    grouped_rewards: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
-    for row in unique_rows:
-        reward_value = row['total_reward']
-        if reward_value is None:
-            continue
-        grouped_rewards[row['group_value']][row['prompt_id']].append(float(reward_value))
-
-    for group_value in sorted({row['group_value'] for row in rows}):
-        group_rows = [row for row in rows if row['group_value'] == group_value]
-        group_unique_rows = [row for row in unique_rows if row['group_value'] == group_value]
-        metrics: Dict[str, float] = {}
-
-        total_rewards = [row['total_reward'] for row in group_rows if row['total_reward'] is not None]
-        reward_mean = _mean(total_rewards)
+    for group_value, prompt_rewards in group_to_prompt_rewards.items():
+        prompt_means = [_mean(values) for values in prompt_rewards.values()]
+        reward_mean = _mean_or_none(prompt_means)
         if reward_mean is not None:
-            metrics['reward'] = reward_mean
+            _append_group_metric(window, group_value, 'reward', reward_mean)
 
-        prompt_groups = grouped_rewards.get(group_value, {})
-        if prompt_groups:
-            prompt_stds = [_std(values) for values in prompt_groups.values()]
-            if prompt_stds:
-                metrics['reward_std'] = float(sum(prompt_stds) / len(prompt_stds))
-                metrics['frac_reward_zero_std'] = float(sum(std == 0.0 for std in prompt_stds) / len(prompt_stds))
+        prompt_stds = [_std(values) if len(values) > 1 else 0.0 for values in prompt_rewards.values()]
+        if self.scale_rewards in ['group', 'none']:
+            reward_std = _mean_or_none(prompt_stds)
+        else:
+            reward_std = _std_or_zero([total_rewards[idx] for idx in group_to_reward_indices[group_value]])
+        if reward_std is not None:
+            _append_group_metric(window, group_value, 'reward_std', reward_std)
+        if prompt_stds:
+            _append_group_metric(window, group_value, 'frac_reward_zero_std',
+                                 float(sum(std == 0.0 for std in prompt_stds) / len(prompt_stds)))
 
-        for reward_name in self.reward_func_names:
-            reward_name_values = [
-                row['rewards'][reward_name]
-                for row in group_unique_rows
-                if row['rewards'][reward_name] is not None
-            ]
-            reward_name_mean = _mean(reward_name_values)
+        for reward_idx, reward_name in enumerate(self.reward_func_names):
+            reward_name_values = [_safe_float(reward_rows[idx][reward_idx])
+                                  for idx in group_to_reward_indices[group_value]]
+            reward_name_mean = _mean_or_none(reward_name_values)
             if reward_name_mean is not None:
-                metrics[f'rewards/{reward_name}/mean'] = reward_name_mean
-                metrics[f'rewards/{reward_name}/std'] = _std(reward_name_values)
+                _append_group_metric(window, group_value, f'rewards/{reward_name}/mean', reward_name_mean)
+                _append_group_metric(window, group_value, f'rewards/{reward_name}/std',
+                                     _std_or_zero(reward_name_values))
 
-        completion_lengths = [row['completion_length'] for row in group_rows if row['completion_length'] is not None]
-        if completion_lengths:
-            metrics['completions/mean_length'] = float(sum(completion_lengths) / len(completion_lengths))
-            metrics['completions/min_length'] = float(min(completion_lengths))
-            metrics['completions/max_length'] = float(max(completion_lengths))
 
-        if group_rows:
-            metrics['completions/clipped_ratio'] = float(
-                sum(bool(row['truncated']) for row in group_rows) / len(group_rows))
+def _record_entropy_metrics(self, window: Dict[str, Any], inputs, metrics_data) -> None:
+    entropy_metrics = metrics_data.get('entropy') or {}
+    entropy_logs = entropy_metrics.get('entropy_logs')
+    group_values = inputs.get('tb_group_values')
+    if entropy_logs is None or group_values is None:
+        return
 
-        entropy_values = [row['entropy'] for row in group_rows if row['entropy'] is not None]
-        if entropy_values:
-            metrics['entropy/mean'] = float(sum(entropy_values) / len(entropy_values))
-            metrics['entropy/min'] = float(min(entropy_values))
-            metrics['entropy/max'] = float(max(entropy_values))
+    global_group_values = gather_object(group_values)
+    flattened_group_values = [value for values in global_group_values for value in values]
+    if len(flattened_group_values) != len(entropy_logs):
+        logger.warning('Skipped grouped entropy metrics because group values and entropy logs had different lengths.')
+        return
 
-        num_turns_values = [row['num_turns'] for row in group_unique_rows if row['num_turns'] is not None]
-        if num_turns_values:
-            metrics['num_turns'] = float(sum(num_turns_values) / len(num_turns_values))
+    grouped_entropies = defaultdict(list)
+    for group_value, entropy_value in zip(flattened_group_values, entropy_logs):
+        safe_entropy = _safe_float(entropy_value)
+        if safe_entropy is not None:
+            grouped_entropies[group_value].append(safe_entropy)
 
-        metrics['samples'] = float(len(group_rows))
-        metrics_by_group[group_value] = metrics
-
-    return metrics_by_group
+    for group_value, entropy_values in grouped_entropies.items():
+        _append_group_metric(window, group_value, 'entropy/mean', float(sum(entropy_values) / len(entropy_values)))
+        _append_group_metric(window, group_value, 'entropy/min', float(min(entropy_values)))
+        _append_group_metric(window, group_value, 'entropy/max', float(max(entropy_values)))
 
 
 def _patch_grpo_trainer():
@@ -269,23 +318,17 @@ def _patch_grpo_trainer():
     original_prepare_metrics = GRPOTrainer._prepare_metrics
     original_generate_and_score_completions = GRPOTrainer._generate_and_score_completions
     original_compute_advantages = GRPOTrainer._compute_advantages
-    original_update_metrics = GRPOTrainer._update_metrics
+    original_compute_loss_and_metrics = GRPOTrainer._compute_loss_and_metrics
     original_log = GRPOTrainer.log
 
     def _prepare_metrics(self):
         original_prepare_metrics(self)
-        group_key = os.environ.get(ENV_KEY, '').strip()
-        self._tb_group_key = group_key or None
+        self._tb_group_key = os.environ.get(ENV_KEY, '').strip() or None
         self._tb_group_writers = {}
         self._tb_group_summary_writer_cls = None
         self._tb_group_run_root = None
-        self._tb_group_windows = {
-            'train': _new_group_window(),
-            'eval': _new_group_window(),
-        }
-        if not self._tb_group_key:
-            return
-        if not self.accelerator.is_main_process:
+        self._tb_group_windows = {'train': _new_group_window(), 'eval': _new_group_window()}
+        if not self._tb_group_key or not self.accelerator.is_main_process:
             return
         try:
             from torch.utils.tensorboard import SummaryWriter
@@ -301,80 +344,44 @@ def _patch_grpo_trainer():
         result = original_generate_and_score_completions(self, inputs)
         if not getattr(self, '_tb_group_key', None):
             return result
-
         try:
             window = _get_group_window(self)
-            group_values = gather_object([_extract_group_value(inp, self._tb_group_key) for inp in inputs])
-            prompt_ids = gather_object([inp.get('prompt_id') for inp in inputs])
-            request_ids = gather_object([inp.get('request_id') for inp in inputs])
-
-            local_lengths = [batch['completion_mask'].sum(1).tolist() for batch in result]
-            total_lengths = self._gather_and_flatten(
-                local_lengths, dtype=torch.float32, device=self.accelerator.device, flatten_level=1).tolist()
-            local_truncated = [batch['truncated_mask'].tolist() for batch in result]
-            total_truncated = self._gather_and_flatten(
-                local_truncated, dtype=torch.bool, device=self.accelerator.device, flatten_level=1).tolist()
-
-            if all('rollout_infos' in inp and 'num_turns' in inp['rollout_infos'] for inp in inputs):
-                total_num_turns = gather_object([inp['rollout_infos']['num_turns'] for inp in inputs])
-            else:
-                total_num_turns = [None] * len(group_values)
-
-            window['group_value'].extend(group_values)
-            window['prompt_id'].extend(prompt_ids)
-            window['request_id'].extend(request_ids)
-            window['completion_length'].extend(total_lengths)
-            window['truncated'].extend(total_truncated)
-            window['num_turns'].extend(total_num_turns)
+            _record_generation_metrics(self, window, result, _collect_group_fields(self, inputs))
         except Exception as exc:
-            logger.warning(f'Failed to collect grouped GRPO metrics: {exc}')
-
+            logger.warning(f'Failed to collect grouped GRPO generation metrics: {exc}')
         return result
 
     def _compute_advantages(self, inputs, rewards_per_func, batch_encoded_inputs):
         advantages = original_compute_advantages(self, inputs, rewards_per_func, batch_encoded_inputs)
-
         if not getattr(self, '_tb_group_key', None):
             return advantages
-
         try:
-            window = _get_group_window(self)
-            reward_rows = rewards_per_func.detach().float().cpu().tolist()
-            for reward_idx, reward_name in enumerate(self.reward_func_names):
-                window['rewards'][reward_name].extend(row[reward_idx] for row in reward_rows)
+            _record_reward_metrics(self, _get_group_window(self), inputs, rewards_per_func, batch_encoded_inputs)
         except Exception as exc:
             logger.warning(f'Failed to collect grouped GRPO reward metrics: {exc}')
-
         return advantages
 
-    def _update_metrics(self, metrics_data):
-        if getattr(self, '_tb_group_key', None):
-            try:
-                entropy_metrics = metrics_data.get('entropy') or {}
-                entropy_logs = entropy_metrics.get('entropy_logs')
-                if entropy_logs is not None:
-                    window = _get_group_window(self, metrics_data.get('mode'))
-                    window['entropy'].extend(entropy_logs)
-            except Exception as exc:
-                logger.warning(f'Failed to collect grouped GRPO entropy metrics: {exc}')
-
-        return original_update_metrics(self, metrics_data)
+    def _compute_loss_and_metrics(self, model, inputs):
+        loss, metrics_data = original_compute_loss_and_metrics(self, model, inputs)
+        if not getattr(self, '_tb_group_key', None):
+            return loss, metrics_data
+        try:
+            _record_entropy_metrics(self, _get_group_window(self, metrics_data.get('mode')), inputs, metrics_data)
+        except Exception as exc:
+            logger.warning(f'Failed to collect grouped GRPO entropy metrics: {exc}')
+        return loss, metrics_data
 
     def log(self, logs, start_time=None):
         original_log(self, logs, start_time)
-
         if not getattr(self, '_tb_group_key', None):
             return
         if not self.accelerator.is_main_process or self._tb_group_summary_writer_cls is None:
             return
 
         mode = 'train' if self.model.training else 'eval'
+        window = _get_group_window(self, mode)
         try:
-            window = _get_group_window(self, mode)
-            rows = _build_rows(self, window)
-            metrics_by_group = _compute_category_metrics(self, rows)
-
-            for group_value, metric_dict in metrics_by_group.items():
+            for group_value, metric_dict in _build_window_metrics(window).items():
                 writer = _get_group_writer(self, group_value)
                 for metric_name, metric_value in metric_dict.items():
                     writer.add_scalar(f'{mode}/{metric_name}', metric_value, self.state.global_step)
@@ -383,12 +390,12 @@ def _patch_grpo_trainer():
         except Exception as exc:
             logger.warning(f'Failed to write grouped GRPO metrics to TensorBoard: {exc}')
         finally:
-            _clear_group_window(_get_group_window(self, mode))
+            _clear_group_window(window)
 
     GRPOTrainer._prepare_metrics = _prepare_metrics
     GRPOTrainer._generate_and_score_completions = _generate_and_score_completions
     GRPOTrainer._compute_advantages = _compute_advantages
-    GRPOTrainer._update_metrics = _update_metrics
+    GRPOTrainer._compute_loss_and_metrics = _compute_loss_and_metrics
     GRPOTrainer.log = log
     setattr(GRPOTrainer, PLUGIN_TAG, True)
 
