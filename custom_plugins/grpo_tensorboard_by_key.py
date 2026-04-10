@@ -161,22 +161,6 @@ def _gather_list(values: List[Any]) -> List[Any]:
     return [gathered]
 
 
-def _collect_group_fields(self, inputs) -> Dict[str, List[Any]]:
-    group_values = [_extract_group_value(inp, self._tb_group_key) for inp in inputs]
-    prompt_ids = [inp.get('prompt_id') for inp in inputs]
-    request_ids = [inp.get('request_id') for inp in inputs]
-    if all('rollout_infos' in inp and 'num_turns' in inp['rollout_infos'] for inp in inputs):
-        num_turns = [inp['rollout_infos']['num_turns'] for inp in inputs]
-    else:
-        num_turns = [None] * len(group_values)
-    return {
-        'group_values': group_values,
-        'prompt_ids': prompt_ids,
-        'request_ids': request_ids,
-        'num_turns': num_turns,
-    }
-
-
 def _collect_global_group_fields(self, inputs) -> Dict[str, List[Any]]:
     global_inputs = _gather_list(inputs)
     return {
@@ -186,20 +170,30 @@ def _collect_global_group_fields(self, inputs) -> Dict[str, List[Any]]:
     }
 
 
-def _record_generation_metrics(self, window: Dict[str, Any], result, fields: Dict[str, List[Any]]) -> None:
+def _record_generation_metrics(self, window: Dict[str, Any], inputs, batch_encoded_inputs) -> None:
+    gas_chunks = self.split_by_mini_batches(inputs)
+    if len(gas_chunks) != len(batch_encoded_inputs):
+        logger.warning('Skipped grouped generation metrics because chunk count did not match encoded batches.')
+        return
+
     local_rows = []
-    cursor = 0
-    for batch in result:
-        batch_size = int(batch['completion_mask'].shape[0])
-        batch_group_values = fields['group_values'][cursor:cursor + batch_size]
-        batch_request_ids = fields['request_ids'][cursor:cursor + batch_size]
-        batch_num_turns = fields['num_turns'][cursor:cursor + batch_size]
+    for batch_inputs, batch_encoded in zip(gas_chunks, batch_encoded_inputs):
+        batch_size = len(batch_inputs)
+        batch_group_values = [_extract_group_value(inp, self._tb_group_key) for inp in batch_inputs]
+        batch_request_ids = [inp.get('request_id') for inp in batch_inputs]
+        if all('rollout_infos' in inp and 'num_turns' in inp['rollout_infos'] for inp in batch_inputs):
+            batch_num_turns = [inp['rollout_infos']['num_turns'] for inp in batch_inputs]
+        else:
+            batch_num_turns = [None] * batch_size
         if len(batch_group_values) != batch_size or len(batch_request_ids) != batch_size or len(batch_num_turns) != batch_size:
             logger.warning('Skipped grouped generation metrics because local group metadata did not match batch size.')
             return
-        batch_lengths = batch['completion_mask'].sum(1).tolist()
-        batch_truncated = batch['truncated_mask'].tolist()
-        batch['tb_group_values'] = batch_group_values
+        batch_lengths = batch_encoded['completion_mask'].sum(1).tolist()
+        batch_truncated = batch_encoded['truncated_mask'].tolist()
+        if len(batch_lengths) != batch_size or len(batch_truncated) != batch_size:
+            logger.warning('Skipped grouped generation metrics because encoded batch tensors did not match batch size.')
+            return
+        batch_encoded['tb_group_values'] = batch_group_values
         for idx in range(batch_size):
             local_rows.append({
                 'group_value': batch_group_values[idx],
@@ -208,11 +202,6 @@ def _record_generation_metrics(self, window: Dict[str, Any], result, fields: Dic
                 'truncated': bool(batch_truncated[idx]),
                 'num_turns': batch_num_turns[idx],
             })
-        cursor += batch_size
-
-    if cursor != len(fields['group_values']):
-        logger.warning('Skipped grouped generation metrics because batch sizes did not match local group values.')
-        return
 
     rows = _gather_list(local_rows)
     group_to_rows = defaultdict(list)
@@ -356,7 +345,7 @@ def _patch_grpo_trainer():
         return
 
     original_prepare_metrics = GRPOTrainer._prepare_metrics
-    original_generate_and_score_completions = GRPOTrainer._generate_and_score_completions
+    original_prepare_batch_inputs = GRPOTrainer._prepare_batch_inputs
     original_compute_advantages = GRPOTrainer._compute_advantages
     original_compute_loss_and_metrics = GRPOTrainer._compute_loss_and_metrics
     original_get_chunked_inputs = GRPOTrainer.get_chunked_inputs
@@ -381,13 +370,13 @@ def _patch_grpo_trainer():
         except Exception as exc:
             logger.warning(f'Failed to initialize TensorBoard SummaryWriter for grouped metrics: {exc}')
 
-    def _generate_and_score_completions(self, inputs):
-        result = original_generate_and_score_completions(self, inputs)
+    def _prepare_batch_inputs(self, inputs):
+        result = original_prepare_batch_inputs(self, inputs)
         if not getattr(self, '_tb_group_key', None):
             return result
         try:
             window = _get_group_window(self)
-            _record_generation_metrics(self, window, result, _collect_group_fields(self, inputs))
+            _record_generation_metrics(self, window, inputs, result)
         except Exception as exc:
             logger.warning(f'Failed to collect grouped GRPO generation metrics: {exc}')
         return result
@@ -440,7 +429,7 @@ def _patch_grpo_trainer():
             _clear_group_window(window)
 
     GRPOTrainer._prepare_metrics = _prepare_metrics
-    GRPOTrainer._generate_and_score_completions = _generate_and_score_completions
+    GRPOTrainer._prepare_batch_inputs = _prepare_batch_inputs
     GRPOTrainer._compute_advantages = _compute_advantages
     GRPOTrainer._compute_loss_and_metrics = _compute_loss_and_metrics
     GRPOTrainer.get_chunked_inputs = get_chunked_inputs
