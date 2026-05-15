@@ -1,14 +1,41 @@
 # ms-swift Local Tools
 
-这个仓库目前放了两个 repo-local 的 ms-swift 扩展：
+这个仓库目前放了三个 repo-local 的 ms-swift 扩展：
 
 - 一个很轻量的 GRPO 外部 plugin，用来把 TensorBoard 指标按样本字段拆开看
 - 一个非侵入式的 vLLM infer 猴子补丁入口，用来把数据集推理改成边编码边投喂 vLLM
+- 一个非侵入式的多教师 GKD/OPSD wrapper，用来在当前 Python 进程里 patch 原生训练逻辑
 
-设计目标只有两件事：
+这些工具的设计目标是：
 
 - 不改上游 `ms-swift` 源码
 - 让 `overall` 和按 key 拆分的 grouped run 尽量保持同一统计口径
+
+## 多教师 GKD/OPSD
+
+当前 fork 通过 wrapper 支持在 GKD/OPSD 训练里传入多个 teacher：
+
+```bash
+python3 scripts/run_multi_teacher_gkd.py \
+  --rlhf_type gkd \
+  --model Qwen/Qwen2.5-7B \
+  --multi_teacher_model Qwen/Qwen2.5-14B-Instruct Qwen/Qwen2.5-32B-Instruct \
+  --multi_teacher_weights 0.5 0.5 \
+  ...
+```
+
+实现方式：
+
+- `scripts/run_multi_teacher_gkd.py` 只解析 wrapper 自己的 `multi_teacher_*` 参数
+- `custom_plugins/multi_teacher_gkd_patch.py` 在当前 Python 进程里 monkey patch 原生 GKD trainer
+- `multi_teacher_model`、`multi_teacher_model_type`、`multi_teacher_model_revision` 支持多值
+- `multi_teacher_weights` 控制多个 teacher 的分布加权，不传则等权
+- 多 teacher 的 logit/probability 会在概率空间加权融合，再和 student 做 GKD 的 JSD loss
+- 如果开启 `seq_kd`，默认用第 0 个 teacher 生成序列，也可以用 `--teacher_seq_kd_index` 指定；
+  logit loss 仍融合所有 teacher
+
+注意：logit-level 多教师蒸馏最好让 student 和所有 teacher 共用 tokenizer/vocab。
+若 vocab 尺寸不一致，当前实现会把 teacher logits 截断或补齐到 student vocab 尺寸。
 
 ## vLLM Infer 猴子补丁入口
 
