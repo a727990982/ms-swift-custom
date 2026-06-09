@@ -1,0 +1,2 @@
+# Vendored copy: keep assets as ordinary Git files so this directory can be
+# cloned without Git LFS.
