@@ -1,0 +1,3 @@
+[submodule "reproduce/recogdrive"]
+	path = reproduce/recogdrive
+	url = https://github.com/xiaomi-research/recogdrive.git
